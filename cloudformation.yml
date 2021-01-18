@@ -1,0 +1,211 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this
+# software and associated documentation files (the "Software"), to deal in the Software
+# without restriction, including without limitation the rights to use, copy, modify,
+# merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so.
+# 
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+# PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Creates an S3 proxy to access S3 Gateway Endpoints over cconnections such as VPN, Direct Connect and VPC Peering.
+Parameters: 
+  InstanceType:
+    Type: String
+    Default: c5n.large
+    Description: Squid proxy instance type.
+  AllowedIpRange:
+    Type: String
+    Description: CIDR Range allowed to use the proxy. Eg the On-prem network using the proxy.
+    Default: 10.0.0.0/8
+  VpcCidr:
+    Type: String
+    Description: The VPC CIDR where the proxy whould be deployed
+    Default: 10.24.34.128/25
+  NumberOfInstances:
+    Type: Number
+    Description: Number of Squid proxies behind the Load balancer.
+    Default: 1
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID to launch this stack
+  Subnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: The subnets the Proxy should be deploy into.
+  ProxyListenerPort:
+    Type: Number
+    Default: 8080
+  ImageId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+
+Resources:
+  NetworkLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internal
+      LoadBalancerAttributes:
+        - Key: load_balancing.cross_zone.enabled
+          Value: 'true'
+      Subnets: !Ref Subnets
+      Type: network
+      IpAddressType: ipv4
+      Tags:
+      - Key: Name
+        Value: !Sub ${AWS::StackName} Network Load Balancer
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+      - TargetGroupArn: !Ref TargetGroupHTTP
+        Type: forward
+      LoadBalancerArn: !Ref NetworkLoadBalancer
+      Port: !Ref ProxyListenerPort
+      Protocol: TCP
+
+  TargetGroupHTTP:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 8888
+      Protocol:  TCP
+      VpcId: !Ref 'VpcId'
+
+  EC2InstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Roles:
+        - Ref: EC2Role
+      Path: /
+  EC2Role:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: s3-all-bucket-proxy-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:*Object*'
+                  - 's3:ListBucket'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'ec2:ModifyInstanceAttribute'
+                Resource: '*'
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  EC2SecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Squid proxy EC2 security group
+      VpcId: !Ref 'VpcId'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8888
+          ToPort: 8888
+          CidrIp: !Ref 'AllowedIpRange'
+        - IpProtocol: tcp
+          FromPort: 8888
+          ToPort: 8888
+          CidrIp: !Ref 'VpcCidr'
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          FromPort: -1
+          IpProtocol: '-1'
+          ToPort: -1
+
+  LaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      AssociatePublicIpAddress: false
+      InstanceType: !Ref InstanceType
+      SecurityGroups:
+        - !Ref EC2SecurityGroup
+      ImageId: !Ref ImageId
+      InstanceMonitoring: true
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      UserData: !Base64
+        Fn::Sub: |
+          #!/bin/bash -xe
+          yum install -y squid
+          instanceID=$(curl http://169.254.169.254/latest/meta-data/instance-id)
+
+          aws ec2 modify-instance-attribute --no-source-dest-check --instance-id $instanceID --region ${AWS::Region}
+          
+          cat > /etc/squid/squid.conf << 'EOF'
+          acl SSL_ports port 443
+          acl Safe_ports port 80                    # http
+          acl Safe_ports port 21                    # ftp
+          acl Safe_ports port 443                  # https
+          acl Safe_ports port 70                    # gopher
+          acl Safe_ports port 210                  # wais
+          acl Safe_ports port 1025-65535  # unregistered ports
+          acl Safe_ports port 280                  # http-mgmt
+          acl Safe_ports port 488                  # gss-http
+          acl Safe_ports port 591                  # filemaker
+          acl Safe_ports port 777                  # multiling http
+          acl CONNECT method CONNECT
+          http_access deny !Safe_ports
+          http_access deny CONNECT !SSL_ports
+          http_access allow localhost manager
+          http_access deny manager
+          http_access allow all
+          http_access allow localhost
+          http_access deny all
+          http_port 8888
+          coredump_dir /var/spool/squid
+          refresh_pattern ^ftp:                     1440       20%        10080
+          refresh_pattern ^gopher:            1440       0%          1440
+          refresh_pattern -i (/cgi-bin/|\?) 0             0%          0
+          refresh_pattern (Release|Packages(.gz)*)$      0       20%     2880
+          refresh_pattern .                             0              20%        4320
+          visible_hostname ec2.internal
+          EOF
+          chmod 400 /etc/squid/squid.conf
+          systemctl start squid
+          systemctl enable squid
+
+  ASGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      DesiredCapacity: !Ref NumberOfInstances
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      VPCZoneIdentifier: !Ref Subnets
+      MaxSize: !Ref NumberOfInstances
+      MinSize: !Ref NumberOfInstances
+      TargetGroupARNs:
+      - !Ref TargetGroupHTTP
+      LaunchConfigurationName: !Ref LaunchConfig
+ 
+Outputs:
+  HttpProxy:
+    Description: NLB DNS Name and Port
+    Value: !Sub http://${NetworkLoadBalancer.DNSName}:${ProxyListenerPort}
+
+  ProxyAddress:
+    Description: NLB DNS Name
+    Value: !Sub ${NetworkLoadBalancer.DNSName}
+
+  ProxyPort:
+    Description: NLB Port
+    Value: !Sub ${ProxyListenerPort}
