@@ -67,6 +67,7 @@ Testing is easiest using the AWS CLI.
 In February 2021 VPC Endpoint for Amazon S3 was released. With the Amazon S3 VPC endpoint you can connect to Amazon S3 from on-premises over AWS Direct Connect Private VIF or AWS VPN without the need to setup your own Proxy fleet. Instead you can leverage the Interface endpoints which is represented by one or more elastic network interfaces (ENIs) in your VPC. However, there are other differences between the implementations where one of the differences is the implementation on the client side:
 * When using the VPC Endpoint for Amazon S3 you need to configure your clients DNS so s3.<region>.amazonaws.com points to the Interface endpoints in your VPC.
 * When using the Amazon S3 Gateway Endpoint Proxy, you need to leverage a HTTP Proxy setting such as an environment variable pointing to the NLB. This means that you don't need to modify any settings to get the Proxy to work and fits use-cases where you can't modify for example DNS settings.
+
 For other differences and how Gateway Endpoints can be used together with VPC Endpoints please see the following documentation page: https://docs.aws.amazon.com/AmazonS3/latest/userguide/privatelink-interface-endpoints.html
 ## Security
 
